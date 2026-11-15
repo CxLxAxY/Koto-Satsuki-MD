@@ -1,0 +1,134 @@
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
+import { createGroupEventHandler } from './core/groupEvents.js';
+import { groupConfigStore, groupScheduler } from './core/groupScheduler.js';
+import { registerGeneralCommands } from './commands/general/index.js';
+import { registerGroupCommands } from './commands/group/index.js';
+import { registerAnimeCommands } from './commands/anime/index.js';
+import { registerComicCommands } from './commands/comic/index.js';
+import { registerDownloaderCommands } from './commands/downloader/index.js';
+import { registerResolverCommands } from './commands/resolver/index.js';
+import { registerWhatsAppDataCommands } from './commands/whatsapp-data/index.js';
+import config, { validateConfig } from './config/config.js';
+import { createConnectionManager } from './core/connection.js';
+import { whatsappArchiveStore } from './services/whatsapp-data/index.js';
+import { memberScraper } from './scrapers/whatsapp/index.js';
+import { warnNewsletterUnavailable } from './utils/newsletterContext.js';
+import logger from './utils/logger.js';
+
+let connectionManager;
+let shutdownPromise;
+const groupEventHandler = createGroupEventHandler({ store: groupConfigStore });
+
+const start = async () => {
+  if (connectionManager) {
+    return;
+  }
+
+  validateConfig();
+  warnNewsletterUnavailable();
+  registerGeneralCommands();
+  registerDownloaderCommands();
+  registerResolverCommands();
+  registerAnimeCommands();
+  registerComicCommands();
+  registerGroupCommands();
+  registerWhatsAppDataCommands();
+  process.umask(0o077);
+  logger.system('Koto Satsuki starting...');
+  await groupConfigStore.load();
+  await groupScheduler.start();
+  try {
+    await whatsappArchiveStore.startRetentionCleanup();
+  } catch (error) {
+    logger.error(
+      'WhatsApp data store is unavailable; data collection will fail closed while the bot continues.',
+      error,
+    );
+  }
+  connectionManager = createConnectionManager({
+    onGroupParticipantsUpdate: (update, socket, resolveParticipant) => {
+      if (config.whatsappData.collectionEnabled) {
+        Promise.resolve(memberScraper.collect(update)).catch((error) => {
+          const code = /^[A-Z0-9_]{1,64}$/u.test(error?.code || '')
+            ? error.code
+            : 'UNKNOWN';
+          logger.error(
+            `Failed to collect aggregate WhatsApp member event. code=${code}`,
+          );
+        });
+      }
+      return groupEventHandler.handle(update, socket, resolveParticipant);
+    },
+    onSocketReady: (socket, resolveParticipant) =>
+      groupScheduler.setSocket(socket, resolveParticipant),
+    onSocketUnavailable: (socket) => groupScheduler.clearSocket(socket),
+  });
+  try {
+    await connectionManager.start();
+  } catch (error) {
+    const failedManager = connectionManager;
+    connectionManager = undefined;
+    try {
+      await failedManager.stop();
+    } catch (cleanupError) {
+      logger.error('Failed to clean up connection manager after startup failure.', cleanupError);
+    }
+    try {
+      await groupScheduler.stop();
+    } catch (cleanupError) {
+      logger.error('Failed to stop group scheduler after startup failure.', cleanupError);
+    }
+    whatsappArchiveStore.stopRetentionCleanup();
+    throw error;
+  }
+};
+
+const stop = async () => {
+  if (!connectionManager) {
+    try {
+      await groupScheduler.stop();
+    } finally {
+      whatsappArchiveStore.stopRetentionCleanup();
+    }
+    return;
+  }
+  const activeManager = connectionManager;
+  connectionManager = undefined;
+  try {
+    await activeManager.stop();
+  } finally {
+    await groupScheduler.stop();
+    whatsappArchiveStore.stopRetentionCleanup();
+  }
+};
+
+const handleShutdown = (signal) => {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+  logger.system(`Received ${signal}; shutting down.`);
+  shutdownPromise = stop().catch((error) => {
+    logger.error('Graceful shutdown failed.', error);
+    process.exitCode = 1;
+  });
+  return shutdownPromise;
+};
+
+process.once('SIGINT', () => void handleShutdown('SIGINT'));
+process.once('SIGTERM', () => void handleShutdown('SIGTERM'));
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  start().catch((error) => {
+    logger.error('Koto Satsuki failed to start.', error);
+    process.exitCode = 1;
+  });
+}
+
+export { start, stop };
+export default { start, stop };
+
+
